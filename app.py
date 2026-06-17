@@ -11,8 +11,10 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import networkx as nx
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from analysis.concept_tracker import build_concept_mentions, summarize_crystallization
@@ -72,6 +74,71 @@ def read_entities(project_id: int) -> pd.DataFrame:
     return df
 
 
+def read_relevamiento_audit(project_id: int) -> pd.DataFrame:
+    con = sqlite3.connect(DATABASE_PATH)
+    df = pd.read_sql_query(
+        """
+        SELECT
+            r.id AS run_id,
+            r.started_at,
+            r.finished_at,
+            r.source,
+            r.platform,
+            r.status,
+            r.max_results,
+            r.retrieved_count AS devueltos_api,
+            r.estimated_cost_usd,
+            COUNT(DISTINCT raw.id) AS paginas_crudas_guardadas,
+            COUNT(DISTINCT p.id) AS posts_normalizados_guardados,
+            COUNT(DISTINCT e.id) AS entidades_extraidas,
+            r.query,
+            r.notes
+        FROM collection_runs r
+        LEFT JOIN raw_items raw ON raw.collection_run_id = r.id
+        LEFT JOIN posts p ON p.collection_run_id = r.id
+        LEFT JOIN post_entities e ON e.post_id = p.id
+        WHERE r.project_id = ?
+        GROUP BY r.id
+        ORDER BY r.started_at DESC
+        """,
+        con,
+        params=(project_id,),
+    )
+    con.close()
+    return df
+
+
+def read_recent_posts_for_audit(project_id: int, limit: int = 200) -> pd.DataFrame:
+    con = sqlite3.connect(DATABASE_PATH)
+    df = pd.read_sql_query(
+        """
+        SELECT
+            p.id,
+            p.collection_run_id,
+            p.platform,
+            p.external_id,
+            p.author_id_hash,
+            p.created_at,
+            p.conversation_id,
+            p.parent_id,
+            p.reposted_id,
+            p.like_count,
+            p.reply_count,
+            p.repost_count,
+            p.quote_count,
+            p.text
+        FROM posts p
+        WHERE p.project_id = ?
+        ORDER BY COALESCE(p.created_at, p.inserted_at) DESC
+        LIMIT ?
+        """,
+        con,
+        params=(project_id, limit),
+    )
+    con.close()
+    return df
+
+
 def sidebar_project_selector() -> int:
     projects = list_projects()
     if projects.empty:
@@ -100,7 +167,15 @@ def run_x_query(
     max_results: int,
     notes: str,
     source_label: str = "api",
-) -> tuple[int, int]:
+) -> tuple[int, int, int, int]:
+    """
+    Ejecuta una query X y guarda:
+    - páginas crudas devueltas por la API en raw_items;
+    - posts normalizados en posts;
+    - entidades textuales en post_entities.
+
+    Devuelve: run_id, devueltos_api, insertados_nuevos, paginas_crudas_guardadas.
+    """
     estimated = estimate_x_cost(int(max_results), X_PRICE_PER_POST_USD)
     run_id = create_collection_run(
         project_id=project_id,
@@ -113,14 +188,50 @@ def run_x_query(
     )
     try:
         posts, raw_payloads = search_recent(query, project_id, run_id, int(max_results))
-        for payload in raw_payloads:
-            insert_raw_item(run_id, "x", None, payload)
+        for idx, payload in enumerate(raw_payloads, start=1):
+            payload_with_audit = {
+                "audit_kind": "x_recent_search_page",
+                "page_number": idx,
+                "query": query,
+                "run_id": run_id,
+                "payload": payload,
+            }
+            insert_raw_item(run_id, "x", f"run_{run_id}_page_{idx}", payload_with_audit)
         inserted = insert_posts(posts)
-        finish_collection_run(run_id, "finished", inserted)
-        return run_id, inserted
+        retrieved = len(posts)
+        finish_collection_run(
+            run_id,
+            "finished",
+            retrieved,
+            notes=f"{notes} | devueltos_api={retrieved}; insertados_nuevos={inserted}; paginas_crudas={len(raw_payloads)}",
+        )
+        return run_id, retrieved, inserted, len(raw_payloads)
     except XCollectorError as exc:
         finish_collection_run(run_id, "error", 0, notes=str(exc))
         raise
+
+
+def render_relevamiento_audit(project_id: int) -> None:
+    st.subheader("Auditoría de persistencia")
+    audit = read_relevamiento_audit(project_id)
+    if audit.empty:
+        st.info("Todavía no hay corridas guardadas.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Corridas", len(audit))
+    c2.metric("Devueltos por API", int(audit["devueltos_api"].fillna(0).sum()))
+    c3.metric("Posts guardados", int(audit["posts_normalizados_guardados"].fillna(0).sum()))
+    c4.metric("Páginas crudas", int(audit["paginas_crudas_guardadas"].fillna(0).sum()))
+
+    st.dataframe(audit, use_container_width=True)
+
+    with st.expander("Últimos posts normalizados guardados", expanded=False):
+        recent = read_recent_posts_for_audit(project_id, limit=200)
+        if recent.empty:
+            st.info("No hay posts normalizados guardados.")
+        else:
+            st.dataframe(recent, use_container_width=True)
 
 
 def tab_inicio(project_id: int) -> None:
@@ -243,18 +354,21 @@ def tab_relevamiento(project_id: int) -> None:
         )
         max_results = st.number_input("Máximo de posts", min_value=10, max_value=10000, value=100, step=10)
         estimated = estimate_x_cost(int(max_results), X_PRICE_PER_POST_USD)
-        st.metric("Costo estimado", f"USD {estimated:.2f}")
-        st.caption("El precio real debe confirmarse en la consola de X. Este valor es configurable en .env.")
+        st.metric("Costo máximo estimado", f"USD {estimated:.2f}")
+        st.caption("La estimación usa el máximo solicitado; X cobra por recurso devuelto, y puede devolver menos.")
 
         if st.button("Ejecutar búsqueda en X", disabled=not bool(X_BEARER_TOKEN)):
             try:
-                _, inserted = run_x_query(
+                _, retrieved, inserted, raw_pages = run_x_query(
                     project_id=project_id,
                     query=query,
                     max_results=int(max_results),
                     notes="Recent Search API - query libre",
                 )
-                st.success(f"Búsqueda finalizada. Posts normalizados insertados: {inserted}")
+                st.success(
+                    f"Búsqueda finalizada. Devueltos por API: {retrieved}. "
+                    f"Insertados nuevos: {inserted}. Páginas crudas guardadas: {raw_pages}."
+                )
             except XCollectorError as exc:
                 st.error(str(exc))
 
@@ -306,21 +420,25 @@ def tab_relevamiento(project_id: int) -> None:
         st.subheader("Query construida")
         st.code(query, language="text")
         st.caption(f"Caracteres: {len(query)} / 512 para Recent Search self-serve")
-        st.metric("Costo estimado", f"USD {estimated:.2f}")
+        st.metric("Costo máximo estimado", f"USD {estimated:.2f}")
+        st.caption("Puede costar menos si X devuelve menos posts que el máximo solicitado.")
 
         if len(query) > 512:
             st.error("La query supera 512 caracteres. Recortá términos para Recent Search.")
 
         if st.button("Ejecutar red temática", disabled=(not bool(X_BEARER_TOKEN) or len(query) > 512)):
             try:
-                _, inserted = run_x_query(
+                _, retrieved, inserted, raw_pages = run_x_query(
                     project_id=project_id,
                     query=query,
                     max_results=int(max_results),
                     notes="Red exploratoria temática - posts only",
                     source_label="api_network_theme",
                 )
-                st.success(f"Relevamiento temático finalizado. Posts insertados: {inserted}")
+                st.success(
+                    f"Relevamiento temático finalizado. Devueltos por API: {retrieved}. "
+                    f"Insertados nuevos: {inserted}. Páginas crudas guardadas: {raw_pages}."
+                )
                 st.info("Ahora revisá Dashboard, Redes y luego Procesamiento → detectar conceptos/clasificar.")
             except XCollectorError as exc:
                 st.error(str(exc))
@@ -368,30 +486,36 @@ def tab_relevamiento(project_id: int) -> None:
             st.markdown(f"**{item.label}** — {item.objective}")
             st.code(item.query, language="text")
         st.metric("Costo máximo estimado", f"USD {total_estimated:.2f}")
-        st.caption("Puede costar menos si X devuelve menos posts que el máximo solicitado.")
+        st.caption("Puede costar menos si X devuelve menos posts que el máximo solicitado. Duplicados entre queries se insertan una sola vez en posts.")
 
         if st.button("Ejecutar red desde post semilla", disabled=(not bool(X_BEARER_TOKEN) or not bool(built))):
+            total_retrieved = 0
             total_inserted = 0
+            total_raw_pages = 0
             errors = []
             for item in built:
                 try:
-                    _, inserted = run_x_query(
+                    _, retrieved, inserted, raw_pages = run_x_query(
                         project_id=project_id,
                         query=item.query,
                         max_results=int(max_per_query),
                         notes=f"Red desde post semilla {post_id} - {item.label}: {item.objective}",
                         source_label="api_network_seed",
                     )
+                    total_retrieved += retrieved
                     total_inserted += inserted
+                    total_raw_pages += raw_pages
                 except XCollectorError as exc:
                     errors.append(f"{item.label}: {exc}")
             if errors:
                 st.error("\n".join(errors))
-            st.success(f"Red desde semilla finalizada. Posts insertados: {total_inserted}")
+            st.success(
+                f"Red desde semilla finalizada. Devueltos por API: {total_retrieved}. "
+                f"Insertados nuevos: {total_inserted}. Páginas crudas guardadas: {total_raw_pages}."
+            )
             st.info("Ahora revisá Redes para hashtags/menciones y Procesamiento para clasificar/detectar conceptos.")
 
-    st.subheader("Corridas")
-    st.dataframe(list_collection_runs(project_id), use_container_width=True)
+    render_relevamiento_audit(project_id)
 
 
 def tab_procesamiento(project_id: int) -> None:
@@ -505,6 +629,118 @@ def tab_conceptos(project_id: int) -> None:
     st.dataframe(df, use_container_width=True)
 
 
+def build_network_figure(posts: pd.DataFrame, entities: pd.DataFrame, max_posts: int = 80) -> go.Figure | None:
+    if posts.empty:
+        return None
+
+    graph = nx.Graph()
+    work_posts = posts.copy()
+    metric_cols = ["like_count", "reply_count", "repost_count", "quote_count"]
+    for col in metric_cols:
+        if col not in work_posts.columns:
+            work_posts[col] = 0
+    work_posts["engagement"] = work_posts[metric_cols].fillna(0).sum(axis=1)
+    work_posts = work_posts.sort_values("engagement", ascending=False).head(max_posts)
+    allowed_post_ids = set(work_posts["id"].astype(int).tolist())
+
+    for _, post in work_posts.iterrows():
+        post_node = f"post:{int(post['id'])}"
+        author_hash = post.get("author_id_hash")
+        graph.add_node(post_node, label=f"post {int(post['id'])}", node_type="post")
+        if pd.notna(author_hash) and str(author_hash).strip():
+            author_node = f"autor:{author_hash}"
+            graph.add_node(author_node, label=str(author_hash)[:10], node_type="autor")
+            graph.add_edge(author_node, post_node, relation="publica")
+        parent_id = post.get("parent_id")
+        if pd.notna(parent_id) and str(parent_id).strip():
+            parent_node = f"post_ext:{parent_id}"
+            graph.add_node(parent_node, label=f"parent {str(parent_id)[-6:]}", node_type="post_referenciado")
+            graph.add_edge(post_node, parent_node, relation="responde_cita")
+        reposted_id = post.get("reposted_id")
+        if pd.notna(reposted_id) and str(reposted_id).strip():
+            repost_node = f"post_ext:{reposted_id}"
+            graph.add_node(repost_node, label=f"repost {str(reposted_id)[-6:]}", node_type="post_referenciado")
+            graph.add_edge(post_node, repost_node, relation="repost")
+
+    if not entities.empty:
+        ent_work = entities[entities["post_id"].isin(allowed_post_ids)].copy()
+        ent_work = ent_work.groupby(["post_id", "entity_type", "entity_value"]).size().reset_index(name="n")
+        for _, ent in ent_work.iterrows():
+            post_node = f"post:{int(ent['post_id'])}"
+            ent_type = str(ent["entity_type"])
+            ent_value = str(ent["entity_value"])
+            ent_node = f"{ent_type}:{ent_value}"
+            graph.add_node(ent_node, label=ent_value[:30], node_type=ent_type)
+            graph.add_edge(post_node, ent_node, relation=ent_type)
+
+    if graph.number_of_nodes() == 0:
+        return None
+
+    pos = nx.spring_layout(graph, seed=42, k=0.7)
+
+    edge_x = []
+    edge_y = []
+    for source, target in graph.edges():
+        x0, y0 = pos[source]
+        x1, y1 = pos[target]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+
+    edge_trace = go.Scatter(
+        x=edge_x,
+        y=edge_y,
+        mode="lines",
+        line=dict(width=0.7),
+        hoverinfo="none",
+        showlegend=False,
+    )
+
+    node_x = []
+    node_y = []
+    node_text = []
+    node_size = []
+    node_symbol = []
+    symbol_map = {
+        "autor": "circle",
+        "post": "square",
+        "post_referenciado": "diamond",
+        "hashtag": "triangle-up",
+        "mention": "triangle-down",
+        "url": "star",
+    }
+    for node, attrs in graph.nodes(data=True):
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        degree = graph.degree(node)
+        ntype = attrs.get("node_type", "otro")
+        node_text.append(f"{attrs.get('label', node)}<br>tipo: {ntype}<br>grado: {degree}")
+        node_size.append(8 + min(degree * 3, 30))
+        node_symbol.append(symbol_map.get(ntype, "circle-open"))
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers",
+        hovertext=node_text,
+        hoverinfo="text",
+        marker=dict(size=node_size, symbol=node_symbol, line=dict(width=1)),
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=[edge_trace, node_trace])
+    fig.update_layout(
+        title="Red exploratoria: autores, posts, entidades y relaciones",
+        showlegend=False,
+        hovermode="closest",
+        margin=dict(b=10, l=10, r=10, t=45),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=650,
+    )
+    return fig
+
+
 def tab_redes(project_id: int) -> None:
     st.header("Redes")
     posts = list_posts(project_id, limit=100000)
@@ -512,6 +748,29 @@ def tab_redes(project_id: int) -> None:
     if posts.empty and entities.empty:
         st.info("Todavía no hay datos para construir redes.")
         return
+
+    st.subheader("Estado de datos para red")
+    autores_unicos = posts["author_id_hash"].dropna().nunique() if not posts.empty and "author_id_hash" in posts.columns else 0
+    relaciones = 0
+    if not posts.empty:
+        relaciones = int(posts["parent_id"].notna().sum() + posts["reposted_id"].notna().sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Posts", len(posts))
+    c2.metric("Autores hasheados", autores_unicos)
+    c3.metric("Entidades", len(entities))
+    c4.metric("Relaciones post-post", relaciones)
+
+    st.subheader("Grafo exploratorio")
+    max_posts = st.slider("Máximo de posts en el grafo", min_value=10, max_value=200, value=80, step=10)
+    fig = build_network_figure(posts, entities, max_posts=max_posts)
+    if fig is None:
+        st.info("No hay datos suficientes para dibujar grafo.")
+    else:
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Lectura: cuadrados = posts, círculos = autores hasheados, triángulos/estrellas = hashtags, menciones o URLs. "
+            "Los autores están hasheados por privacidad; se pueden enriquecer selectivamente después."
+        )
 
     st.subheader("Nodos de autores hasheados")
     if not posts.empty and "author_id_hash" in posts.columns:
@@ -529,10 +788,21 @@ def tab_redes(project_id: int) -> None:
         )
         if not authors.empty:
             authors["interacciones_publicas"] = authors[["likes", "replies", "reposts", "quotes"]].sum(axis=1)
-            authors = authors.sort_values(["publicaciones", "interacciones_publicas"], ascending=False).head(30)
+            authors = authors.sort_values(["publicaciones", "interacciones_publicas"], ascending=False).head(50)
             st.dataframe(authors, use_container_width=True)
         else:
             st.info("Todavía no hay autores detectados.")
+
+    if not posts.empty:
+        st.subheader("Relaciones conversacionales")
+        rel_cols = ["id", "external_id", "conversation_id", "parent_id", "reposted_id", "author_id_hash", "text"]
+        rel_cols = [c for c in rel_cols if c in posts.columns]
+        rel_df = posts[rel_cols].copy()
+        rel_df = rel_df[(rel_df.get("parent_id").notna() if "parent_id" in rel_df else False) | (rel_df.get("reposted_id").notna() if "reposted_id" in rel_df else False)]
+        if rel_df.empty:
+            st.info("No hay relaciones parent/repost registradas en los posts normalizados.")
+        else:
+            st.dataframe(rel_df.head(200), use_container_width=True)
 
     if not entities.empty:
         st.subheader("Entidades y coocurrencias")
@@ -542,14 +812,14 @@ def tab_redes(project_id: int) -> None:
             st.info("Sin datos para este tipo de entidad.")
             return
         top = df.groupby("entity_value").size().reset_index(name="cantidad").sort_values("cantidad", ascending=False).head(50)
-        fig = px.bar(top, x="cantidad", y="entity_value", orientation="h", title=f"Top {entity_type}")
-        st.plotly_chart(fig, use_container_width=True)
+        fig_top = px.bar(top, x="cantidad", y="entity_value", orientation="h", title=f"Top {entity_type}")
+        st.plotly_chart(fig_top, use_container_width=True)
         st.dataframe(top, use_container_width=True)
+    else:
+        st.info("No se extrajeron hashtags, menciones ni URLs de estos posts. La red se limita a autores, posts y relaciones conversacionales.")
 
-    st.caption(
-        "Esta red inicial usa autores hasheados, hashtags, menciones y URLs. "
-        "La siguiente iteración agregará grafo interactivo y detección de comunidades."
-    )
+    st.subheader("Posts usados por la red")
+    st.dataframe(posts.head(200), use_container_width=True)
 
 
 def tab_reportes(project_id: int) -> None:
