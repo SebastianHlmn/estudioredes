@@ -3,6 +3,11 @@ collectors/x_collector.py
 Colector inicial para X / Twitter usando API v2 Recent Search.
 
 Requiere X_BEARER_TOKEN en .env.
+
+Criterio de costo MVP:
+- Pedir solo campos del Post.
+- No pedir expansiones de usuarios ni posts referenciados por defecto.
+- Guardar author_id hasheado, sin resolver username, para evitar lecturas extra de User.
 """
 
 from __future__ import annotations
@@ -27,15 +32,6 @@ DEFAULT_TWEET_FIELDS = [
     "entities",
     "lang",
 ]
-
-DEFAULT_EXPANSIONS = [
-    "author_id",
-    "referenced_tweets.id",
-    "referenced_tweets.id.author_id",
-    "entities.mentions.username",
-]
-
-DEFAULT_USER_FIELDS = ["id", "username", "name", "verified", "public_metrics"]
 
 
 class XCollectorError(RuntimeError):
@@ -66,6 +62,12 @@ def search_recent(
     Devuelve:
     - posts normalizados para insertar en SQLite.
     - raw_items originales para auditoría.
+
+    Nota de costo:
+    En esta versión se evitan expansions para no sumar lecturas de usuarios
+    ni posts referenciados. Si más adelante necesitamos usernames, followers
+    o detalles del post citado/respondido, conviene hacerlo en una segunda
+    corrida selectiva sobre una muestra o sobre nodos centrales.
     """
     if max_results < 10:
         max_results = 10
@@ -82,8 +84,6 @@ def search_recent(
             "query": query,
             "max_results": page_size,
             "tweet.fields": ",".join(DEFAULT_TWEET_FIELDS),
-            "expansions": ",".join(DEFAULT_EXPANSIONS),
-            "user.fields": ",".join(DEFAULT_USER_FIELDS),
         }
         if next_token:
             params["next_token"] = next_token
@@ -102,15 +102,9 @@ def search_recent(
 
         payload = response.json()
         raw_items.append(payload)
-        users = {
-            u.get("id"): u
-            for u in payload.get("includes", {}).get("users", [])
-            if u.get("id")
-        }
 
         for item in payload.get("data", []):
             metrics = item.get("public_metrics", {}) or {}
-            author = users.get(item.get("author_id"), {})
             referenced = item.get("referenced_tweets", []) or []
             parent_id = None
             reposted_id = None
@@ -120,16 +114,17 @@ def search_recent(
                 if ref.get("type") == "retweeted":
                     reposted_id = ref.get("id")
 
+            post_id = item.get("id")
             base = {
                 "project_id": project_id,
                 "collection_run_id": collection_run_id,
                 "platform": "x",
-                "external_id": item.get("id"),
+                "external_id": post_id,
                 "author_id": item.get("author_id"),
-                "author_label": author.get("username"),
+                "author_label": None,
                 "created_at": item.get("created_at"),
                 "text": item.get("text", ""),
-                "url": f"https://x.com/{author.get('username')}/status/{item.get('id')}" if author.get("username") and item.get("id") else None,
+                "url": f"https://x.com/i/web/status/{post_id}" if post_id else None,
                 "conversation_id": item.get("conversation_id"),
                 "parent_id": parent_id,
                 "reposted_id": reposted_id,
