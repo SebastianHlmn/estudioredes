@@ -205,7 +205,8 @@ def seed_defaults() -> None:
         DEFAULT_PROJECT_NAME,
         "Primera investigación: discurso antifeminista, estrategias discursivas, circulación en redes y cristalización conceptual.",
     )
-    if not list_codebooks(project_id):
+    codebooks_df = list_codebooks(project_id)
+    if codebooks_df.empty:
         create_default_codebook(project_id)
 
 
