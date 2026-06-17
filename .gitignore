@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Conda
+.conda/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Entorno y credenciales
+.env
+.env.local
+.env.*.local
+
+# Datos locales
+data/*.sqlite
+data/*.db
+data/raw/
+data/processed/
+exports/
+reports/exports/
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs
+*.log
