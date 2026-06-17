@@ -2,13 +2,16 @@
 db_manager.py
 Capa SQLite para EstudioRedes.
 
-Diseño inicial:
+Diseño:
 - Proyectos temáticos reutilizables.
 - Corridas de relevamiento trazables.
 - Datos crudos y normalizados.
 - Entidades extraídas.
+- Laboratorio de queries y semillas.
 - Clasificaciones discursivas.
 - Menciones conceptuales y etapas de cristalización.
+- Persistencia de nodos/aristas para redes exploratorias.
+- Auditoría de uso de APIs.
 """
 
 from __future__ import annotations
@@ -50,6 +53,12 @@ def init_db() -> None:
 
     cur.executescript(
         """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            description TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
@@ -64,6 +73,40 @@ def init_db() -> None:
             version TEXT NOT NULL,
             description TEXT,
             schema_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS query_lab (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            platform TEXT NOT NULL,
+            query_name TEXT,
+            query_type TEXT NOT NULL DEFAULT 'thematic',
+            concept TEXT,
+            query_text TEXT NOT NULL,
+            objective TEXT,
+            expected_noise TEXT,
+            status TEXT NOT NULL DEFAULT 'borrador',
+            max_results_test INTEGER,
+            last_run_id INTEGER,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id),
+            FOREIGN KEY(last_run_id) REFERENCES collection_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS seed_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            platform TEXT NOT NULL,
+            seed_type TEXT NOT NULL,
+            seed_value TEXT NOT NULL,
+            external_id TEXT,
+            url TEXT,
+            label TEXT,
+            description TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id)
         );
@@ -84,6 +127,25 @@ def init_db() -> None:
             FOREIGN KEY(project_id) REFERENCES projects(id)
         );
 
+        CREATE TABLE IF NOT EXISTS api_usage_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collection_run_id INTEGER,
+            project_id INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            endpoint TEXT,
+            pricing_unit TEXT,
+            requested_limit INTEGER,
+            returned_items INTEGER DEFAULT 0,
+            inserted_items INTEGER DEFAULT 0,
+            raw_pages INTEGER DEFAULT 0,
+            estimated_cost_usd REAL DEFAULT 0,
+            observed_cost_usd REAL,
+            created_at TEXT NOT NULL,
+            notes TEXT,
+            FOREIGN KEY(collection_run_id) REFERENCES collection_runs(id),
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );
+
         CREATE TABLE IF NOT EXISTS raw_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             collection_run_id INTEGER NOT NULL,
@@ -97,6 +159,26 @@ def init_db() -> None:
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_unique
         ON raw_items(platform, external_id, hash_content);
+
+        CREATE TABLE IF NOT EXISTS authors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            platform TEXT NOT NULL,
+            author_id_hash TEXT NOT NULL,
+            public_label TEXT,
+            author_type TEXT,
+            is_public_figure INTEGER DEFAULT 0,
+            enrichment_status TEXT NOT NULL DEFAULT 'not_enriched',
+            metadata_json TEXT,
+            first_seen_at TEXT,
+            last_seen_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_authors_project_platform_hash
+        ON authors(project_id, platform, author_id_hash);
 
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,6 +209,15 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_posts_project_date
         ON posts(project_id, created_at);
 
+        CREATE INDEX IF NOT EXISTS idx_posts_collection_run
+        ON posts(collection_run_id);
+
+        CREATE INDEX IF NOT EXISTS idx_posts_conversation
+        ON posts(platform, conversation_id);
+
+        CREATE INDEX IF NOT EXISTS idx_posts_author_hash
+        ON posts(project_id, platform, author_id_hash);
+
         CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_unique_external
         ON posts(platform, external_id)
         WHERE external_id IS NOT NULL;
@@ -141,6 +232,9 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_entities_type_value
         ON post_entities(entity_type, entity_value);
+
+        CREATE INDEX IF NOT EXISTS idx_entities_post
+        ON post_entities(post_id);
 
         CREATE TABLE IF NOT EXISTS classifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -192,7 +286,86 @@ def init_db() -> None:
             created_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id)
         );
+
+        CREATE TABLE IF NOT EXISTS network_builds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            network_type TEXT NOT NULL,
+            parameters_json TEXT,
+            source_runs_json TEXT,
+            created_at TEXT NOT NULL,
+            notes TEXT,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS network_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            network_build_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            node_key TEXT NOT NULL,
+            node_type TEXT NOT NULL,
+            label TEXT,
+            weight REAL DEFAULT 1,
+            degree REAL,
+            centrality REAL,
+            community TEXT,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(network_build_id) REFERENCES network_builds(id),
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_network_nodes_unique
+        ON network_nodes(network_build_id, node_key);
+
+        CREATE TABLE IF NOT EXISTS network_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            network_build_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            source_node_key TEXT NOT NULL,
+            target_node_key TEXT NOT NULL,
+            edge_type TEXT NOT NULL,
+            weight REAL DEFAULT 1,
+            post_id INTEGER,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(network_build_id) REFERENCES network_builds(id),
+            FOREIGN KEY(project_id) REFERENCES projects(id),
+            FOREIGN KEY(post_id) REFERENCES posts(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_network_edges_build
+        ON network_edges(network_build_id);
+
+        CREATE TABLE IF NOT EXISTS processing_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            process_type TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            input_count INTEGER DEFAULT 0,
+            output_count INTEGER DEFAULT 0,
+            model_used TEXT,
+            prompt_version TEXT,
+            parameters_json TEXT,
+            notes TEXT,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );
         """
+    )
+
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO schema_migrations(version, applied_at, description)
+        VALUES (?, ?, ?)
+        """,
+        (
+            "0.2_research_network_schema",
+            now_iso(),
+            "Amplía la base para laboratorio de queries, semillas, autores, auditoría API, redes persistidas y procesos.",
+        ),
     )
 
     con.commit()
@@ -358,6 +531,52 @@ def finish_collection_run(run_id: int, status: str, retrieved_count: int, notes:
     con.close()
 
 
+def log_api_usage(
+    project_id: int,
+    collection_run_id: int | None,
+    provider: str,
+    endpoint: str,
+    pricing_unit: str,
+    requested_limit: int | None,
+    returned_items: int,
+    inserted_items: int,
+    raw_pages: int,
+    estimated_cost_usd: float = 0.0,
+    observed_cost_usd: float | None = None,
+    notes: str = "",
+) -> int:
+    con = get_connection()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO api_usage_log(
+            collection_run_id, project_id, provider, endpoint, pricing_unit,
+            requested_limit, returned_items, inserted_items, raw_pages,
+            estimated_cost_usd, observed_cost_usd, created_at, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            collection_run_id,
+            project_id,
+            provider,
+            endpoint,
+            pricing_unit,
+            requested_limit,
+            returned_items,
+            inserted_items,
+            raw_pages,
+            estimated_cost_usd,
+            observed_cost_usd,
+            now_iso(),
+            notes,
+        ),
+    )
+    con.commit()
+    usage_id = int(cur.lastrowid)
+    con.close()
+    return usage_id
+
+
 def insert_raw_item(collection_run_id: int, platform: str, external_id: str | None, raw: dict[str, Any]) -> None:
     raw_json = json.dumps(raw, ensure_ascii=False, sort_keys=True)
     content_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
@@ -373,11 +592,56 @@ def insert_raw_item(collection_run_id: int, platform: str, external_id: str | No
     con.close()
 
 
+def upsert_author(
+    project_id: int,
+    platform: str,
+    author_id_hash: str | None,
+    public_label: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if not author_id_hash:
+        return
+    metadata_json = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
+    con = get_connection()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO authors(
+            project_id, platform, author_id_hash, public_label, metadata_json,
+            first_seen_at, last_seen_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id, platform, author_id_hash) DO UPDATE SET
+            public_label = COALESCE(excluded.public_label, authors.public_label),
+            metadata_json = CASE
+                WHEN excluded.metadata_json != '{}' THEN excluded.metadata_json
+                ELSE authors.metadata_json
+            END,
+            last_seen_at = excluded.last_seen_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            project_id,
+            platform,
+            author_id_hash,
+            public_label,
+            metadata_json,
+            now_iso(),
+            now_iso(),
+            now_iso(),
+            now_iso(),
+        ),
+    )
+    con.commit()
+    con.close()
+
+
 def insert_posts(posts: Iterable[dict[str, Any]]) -> int:
     con = get_connection()
     cur = con.cursor()
     inserted = 0
+    authors_to_upsert: list[tuple[int, str, str | None, str | None]] = []
     for post in posts:
+        author_hash = hash_value(post.get("author_id")) if post.get("author_id") else post.get("author_id_hash")
         cur.execute(
             """
             INSERT OR IGNORE INTO posts(
@@ -391,7 +655,7 @@ def insert_posts(posts: Iterable[dict[str, Any]]) -> int:
                 post.get("collection_run_id"),
                 post.get("platform"),
                 post.get("external_id"),
-                hash_value(post.get("author_id")) if post.get("author_id") else post.get("author_id_hash"),
+                author_hash,
                 post.get("author_label"),
                 post.get("created_at"),
                 post.get("text", ""),
@@ -409,6 +673,15 @@ def insert_posts(posts: Iterable[dict[str, Any]]) -> int:
                 now_iso(),
             ),
         )
+        if author_hash:
+            authors_to_upsert.append(
+                (
+                    int(post.get("project_id")),
+                    str(post.get("platform")),
+                    str(author_hash),
+                    post.get("author_label"),
+                )
+            )
         if cur.rowcount > 0:
             inserted += 1
             post_id = int(cur.lastrowid)
@@ -419,6 +692,13 @@ def insert_posts(posts: Iterable[dict[str, Any]]) -> int:
                 )
     con.commit()
     con.close()
+
+    seen_authors = set()
+    for project_id, platform, author_hash, author_label in authors_to_upsert:
+        key = (project_id, platform, author_hash)
+        if key not in seen_authors:
+            upsert_author(project_id, platform, author_hash, author_label)
+            seen_authors.add(key)
     return inserted
 
 
@@ -559,5 +839,39 @@ def concept_mentions_df(project_id: int) -> pd.DataFrame:
     )
     con.close()
     return df
+
+
+def db_inventory() -> pd.DataFrame:
+    """Devuelve cantidad de registros por tabla de investigación."""
+    tables = [
+        "projects",
+        "codebooks",
+        "query_lab",
+        "seed_items",
+        "collection_runs",
+        "api_usage_log",
+        "raw_items",
+        "authors",
+        "posts",
+        "post_entities",
+        "classifications",
+        "concept_mentions",
+        "events",
+        "network_builds",
+        "network_nodes",
+        "network_edges",
+        "processing_runs",
+        "schema_migrations",
+    ]
+    con = get_connection()
+    rows = []
+    for table in tables:
+        try:
+            count = con.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        except sqlite3.OperationalError:
+            count = None
+        rows.append({"tabla": table, "registros": count})
+    con.close()
+    return pd.DataFrame(rows)
 
 # fin db_manager.py
